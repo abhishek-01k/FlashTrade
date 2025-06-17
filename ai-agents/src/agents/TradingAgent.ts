@@ -1,434 +1,306 @@
-import { Agent, Client } from "alith";
-import { ethers } from "ethers";
-import { z } from "zod";
-import { createLogger } from "../utils/logger.js";
-import { MarketDataProvider } from "../providers/MarketDataProvider.js";
-import { HyperionClient } from "../clients/HyperionClient.js";
-import { PricePredictor } from "../models/PricePredictor.js";
-import { LiquidityOptimizer } from "../models/LiquidityOptimizer.js";
-import { MEVDetector } from "../models/MEVDetector.js";
+import { PricePredictor } from '../models/PricePredictor.js';
+import { HyperionClient } from '../clients/HyperionClient.js';
+import { logger } from '../utils/logger.js';
 
-const logger = createLogger("TradingAgent");
+// Placeholder interface for Alith Agent
+interface AlithAgent {
+  name: string;
+  initialize(): Promise<void>;
+  processMessage(message: string): Promise<string>;
+  addTool(tool: any): void;
+}
 
-// Schemas for type safety
-const MarketDataSchema = z.object({
-  pair: z.string(),
-  reserveA: z.string(),
-  reserveB: z.string(),
-  price: z.number(),
-  volume24h: z.number(),
-  timestamp: z.number()
-});
+interface TradingDecision {
+  action: 'buy' | 'sell' | 'hold';
+  confidence: number;
+  amount?: number;
+  reason: string;
+}
 
-const TradingSignalSchema = z.object({
-  action: z.enum(["BUY", "SELL", "HOLD", "ADD_LIQUIDITY"]),
-  confidence: z.number().min(0).max(100),
-  amount: z.string().optional(),
-  expectedPrice: z.number(),
-  riskLevel: z.enum(["LOW", "MEDIUM", "HIGH"]),
-  mevRisk: z.boolean()
-});
+interface MarketData {
+  symbol: string;
+  price: number;
+  volume: number;
+  timestamp: number;
+  high24h?: number;
+  low24h?: number;
+  change24h?: number;
+}
 
-export type MarketData = z.infer<typeof MarketDataSchema>;
-export type TradingSignal = z.infer<typeof TradingSignalSchema>;
+interface TradingContext {
+  marketData: MarketData;
+  prediction: number;
+  confidence: number;
+  portfolio: {
+    balance: number;
+    positions: Array<{
+      symbol: string;
+      amount: number;
+      value: number;
+    }>;
+  };
+}
 
-/**
- * AI Trading Agent powered by Alith for FlashTrade DEX
- * Provides price predictions, market making, and MEV resistance
- */
 export class TradingAgent {
-  private agent: Agent;
-  private client: Client;
-  private marketDataProvider: MarketDataProvider;
+  private predictor: PricePredictor;
   private hyperionClient: HyperionClient;
-  private pricePredictor: PricePredictor;
-  private liquidityOptimizer: LiquidityOptimizer;
-  private mevDetector: MEVDetector;
-  private isRunning: boolean = false;
+  private agent: AlithAgent | null = null;
+  private isInitialized = false;
 
   constructor(
-    private config: {
-      alithApiKey: string;
-      hyperionRpc: string;
-      contractAddress: string;
-      privateKey: string;
-      updateInterval: number;
+    private readonly config: {
+      name: string;
+      riskTolerance: number;
+      maxPositionSize: number;
+      minConfidence: number;
     }
   ) {
-    // Initialize Alith client
-    this.client = new Client({
-      apiKey: config.alithApiKey,
-      endpoint: "https://api.alith.ai" // Production endpoint
+    this.predictor = new PricePredictor({
+      sequenceLength: 60,
+      hiddenUnits: 50,
+      learningRate: 0.001
     });
-
-    // Initialize AI models
-    this.pricePredictor = new PricePredictor();
-    this.liquidityOptimizer = new LiquidityOptimizer();
-    this.mevDetector = new MEVDetector();
-
-    // Initialize market data provider
-    this.marketDataProvider = new MarketDataProvider();
     
-    // Initialize Hyperion client
-    this.hyperionClient = new HyperionClient(
-      config.hyperionRpc,
-      config.contractAddress,
-      config.privateKey
-    );
-
-    // Configure AI agent
-    this.agent = new Agent({
-      client: this.client,
-      model: "gpt-4o-mini", // Use available model
-      preamble: `You are an expert AI trader for FlashTrade DEX on Metis Hyperion.
-        
-        Your role:
-        1. Analyze real-time market data from multiple sources
-        2. Generate accurate price predictions using CNN-LSTM models
-        3. Optimize liquidity provision using Graph Neural Networks
-        4. Detect and prevent MEV attacks using transformer models
-        5. Execute profitable trades while minimizing risk
-        
-        You have access to:
-        - Real-time market data from Hyperion and external sources
-        - Historical price and volume data
-        - On-chain liquidity metrics
-        - MEV detection algorithms
-        - Parallel execution capabilities for optimal trade routing
-        
-        Always prioritize:
-        - Risk management and user protection
-        - Profitable opportunities with high confidence
-        - MEV resistance through parallel execution
-        - Optimal liquidity provisioning
-        
-        Respond with specific, actionable trading recommendations based on data analysis.`,
-      
-      tools: [
-        {
-          name: "analyze_market_data",
-          description: "Analyze current market conditions and generate trading signals",
-          parameters: {
-            type: "object",
-            properties: {
-              marketData: {
-                type: "object",
-                description: "Current market data for analysis"
-              }
-            },
-            required: ["marketData"]
-          }
-        },
-        {
-          name: "predict_price_movement",
-          description: "Predict future price movements using AI models",
-          parameters: {
-            type: "object",
-            properties: {
-              pair: { type: "string" },
-              timeframe: { type: "string" },
-              historicalData: { type: "array" }
-            },
-            required: ["pair", "timeframe"]
-          }
-        },
-        {
-          name: "optimize_liquidity",
-          description: "Calculate optimal liquidity provision amounts",
-          parameters: {
-            type: "object",
-            properties: {
-              pair: { type: "string" },
-              availableA: { type: "string" },
-              availableB: { type: "string" },
-              targetAPY: { type: "number" }
-            },
-            required: ["pair", "availableA", "availableB"]
-          }
-        },
-        {
-          name: "detect_mev_risk",
-          description: "Analyze transaction for MEV risks",
-          parameters: {
-            type: "object",
-            properties: {
-              transactionData: { type: "object" },
-              mempool: { type: "array" }
-            },
-            required: ["transactionData"]
-          }
-        },
-        {
-          name: "execute_trade",
-          description: "Execute a trade on FlashTrade DEX",
-          parameters: {
-            type: "object",
-            properties: {
-              tokenIn: { type: "string" },
-              tokenOut: { type: "string" },
-              amountIn: { type: "string" },
-              minAmountOut: { type: "string" },
-              useParallel: { type: "boolean" }
-            },
-            required: ["tokenIn", "tokenOut", "amountIn", "minAmountOut"]
-          }
-        }
-      ]
+    this.hyperionClient = new HyperionClient({
+      rpcUrl: process.env.HYPERION_RPC_URL || 'https://hyperion-testnet.metisdevops.link',
+      privateKey: process.env.PRIVATE_KEY || '',
+      contractAddress: process.env.FLASHTRADE_CONTRACT || ''
     });
-
-    this.setupToolHandlers();
   }
 
-  /**
-   * Start the trading agent
-   */
-  async start(): Promise<void> {
-    logger.info("Starting FlashTrade AI Trading Agent...");
-    this.isRunning = true;
-
-    // Initialize connections
-    await this.hyperionClient.connect();
-    await this.marketDataProvider.connect();
-
-    // Start monitoring and trading loop
-    this.startTradingLoop();
-
-    logger.info("Trading Agent started successfully");
-  }
-
-  /**
-   * Stop the trading agent
-   */
-  async stop(): Promise<void> {
-    logger.info("Stopping Trading Agent...");
-    this.isRunning = false;
-    
-    await this.hyperionClient.disconnect();
-    await this.marketDataProvider.disconnect();
-    
-    logger.info("Trading Agent stopped");
-  }
-
-  /**
-   * Main trading loop - analyzes market and executes strategies
-   */
-  private async startTradingLoop(): Promise<void> {
-    while (this.isRunning) {
-      try {
-        // Get current market data
-        const marketData = await this.marketDataProvider.getAllMarketData();
-        
-        // Analyze each active trading pair
-        for (const market of marketData) {
-          const signal = await this.analyzeMarketAndGenerateSignal(market);
-          
-          if (signal.confidence > 70) { // High confidence threshold
-            await this.executeTradingSignal(signal, market);
-          }
-        }
-
-        // Wait for next iteration
-        await new Promise(resolve => setTimeout(resolve, this.config.updateInterval));
-        
-      } catch (error) {
-        logger.error("Error in trading loop:", error);
-        await new Promise(resolve => setTimeout(resolve, 5000)); // Error backoff
-      }
-    }
-  }
-
-  /**
-   * Analyze market data and generate trading signal using AI
-   */
-  private async analyzeMarketAndGenerateSignal(marketData: MarketData): Promise<TradingSignal> {
+  async initialize(): Promise<void> {
     try {
-      // Get AI analysis
-      const response = await this.agent.run(
-        `Analyze the following market data and provide a trading recommendation:
-        
-        Market: ${marketData.pair}
-        Reserve A: ${marketData.reserveA}
-        Reserve B: ${marketData.reserveB}
-        Current Price: $${marketData.price}
-        24h Volume: $${marketData.volume24h}
-        Timestamp: ${new Date(marketData.timestamp * 1000).toISOString()}
-        
-        Please analyze this data and provide a specific trading recommendation with confidence level.`,
-        
-        { marketData }
-      );
+      logger.info('Initializing TradingAgent...', { name: this.config.name });
 
-      // Parse AI response into structured signal
-      return this.parseAIResponse(response.content, marketData);
-      
+      // Initialize AI predictor
+      await this.predictor.initialize();
+      logger.info('Price predictor initialized');
+
+      // Initialize Hyperion client
+      await this.hyperionClient.initialize();
+      logger.info('Hyperion client initialized');
+
+      // Initialize Alith agent (placeholder implementation)
+      this.agent = await this.createAlithAgent();
+      await this.agent.initialize();
+      logger.info('Alith agent initialized');
+
+      this.isInitialized = true;
+      logger.info('TradingAgent fully initialized');
     } catch (error) {
-      logger.error("Error generating trading signal:", error);
-      
-      // Fallback to basic analysis
-      return this.generateFallbackSignal(marketData);
+      logger.error('Failed to initialize TradingAgent', { error });
+      throw error;
     }
   }
 
-  /**
-   * Execute trading signal
-   */
-  private async executeTradingSignal(signal: TradingSignal, marketData: MarketData): Promise<void> {
-    logger.info(`Executing trading signal: ${signal.action} for ${marketData.pair}`);
-
-    try {
-      switch (signal.action) {
-        case "BUY":
-        case "SELL":
-          await this.executeTrade(signal, marketData);
-          break;
-          
-        case "ADD_LIQUIDITY":
-          await this.addLiquidity(signal, marketData);
-          break;
-          
-        case "HOLD":
-          logger.info(`Holding position for ${marketData.pair}`);
-          break;
+  private async createAlithAgent(): Promise<AlithAgent> {
+    // Placeholder implementation for Alith agent
+    // In production, this would use the actual Alith SDK
+    return {
+      name: this.config.name,
+      async initialize() {
+        // Initialize Alith agent
+      },
+      async processMessage(message: string) {
+        // Process message with Alith
+        return `Processed: ${message}`;
+      },
+      addTool(tool: any) {
+        // Add tool to Alith agent
       }
-    } catch (error) {
-      logger.error("Error executing trading signal:", error);
-    }
-  }
-
-  /**
-   * Execute a trade using the AI signal
-   */
-  private async executeTrade(signal: TradingSignal, marketData: MarketData): Promise<void> {
-    const [tokenA, tokenB] = marketData.pair.split("/");
-    
-    const tradeParams = {
-      tokenIn: signal.action === "BUY" ? tokenB : tokenA,
-      tokenOut: signal.action === "BUY" ? tokenA : tokenB,
-      amountIn: signal.amount || "1000000000000000000", // 1 token default
-      minAmountOut: "0", // Will be calculated
-      useParallel: signal.mevRisk
     };
-
-    await this.hyperionClient.executeTrade(tradeParams);
-    
-    logger.info(`Executed ${signal.action} for ${marketData.pair} with confidence ${signal.confidence}%`);
   }
 
-  /**
-   * Add liquidity based on AI optimization
-   */
-  private async addLiquidity(signal: TradingSignal, marketData: MarketData): Promise<void> {
-    const optimizedAmounts = await this.liquidityOptimizer.calculateOptimalAmounts(
-      marketData,
-      signal.expectedPrice
-    );
+  async analyzeMarket(symbol: string): Promise<TradingDecision> {
+    if (!this.isInitialized) {
+      throw new Error('Agent not initialized');
+    }
 
-    await this.hyperionClient.addLiquidity({
-      pair: marketData.pair,
-      amountA: optimizedAmounts.amountA,
-      amountB: optimizedAmounts.amountB
-    });
+    try {
+      logger.info('Analyzing market', { symbol });
 
-    logger.info(`Added optimized liquidity for ${marketData.pair}`);
-  }
-
-  /**
-   * Setup tool handlers for AI agent
-   */
-  private setupToolHandlers(): void {
-    // Market analysis tool
-    this.agent.addToolHandler("analyze_market_data", async (params: any) => {
-      const marketData = MarketDataSchema.parse(params.marketData);
+      // Get current market data
+      const marketData = await this.getMarketData(symbol);
       
-      // Use AI models for analysis
-      const pricePrediction = await this.pricePredictor.predict(marketData);
-      const liquidityAnalysis = await this.liquidityOptimizer.analyze(marketData);
-      const mevRisk = await this.mevDetector.assessRisk(marketData);
+      // Get AI prediction
+      const prediction = await this.predictor.predict([marketData.price]);
+      const confidence = await this.calculateConfidence(marketData, prediction);
 
-      return {
-        pricePrediction,
-        liquidityAnalysis,
-        mevRisk,
-        recommendation: this.generateRecommendation(pricePrediction, liquidityAnalysis, mevRisk)
+      // Create trading context
+      const context: TradingContext = {
+        marketData,
+        prediction,
+        confidence,
+        portfolio: await this.getPortfolioStatus()
       };
-    });
 
-    // Price prediction tool
-    this.agent.addToolHandler("predict_price_movement", async (params: any) => {
-      return await this.pricePredictor.predictMovement(
-        params.pair,
-        params.timeframe,
-        params.historicalData
-      );
-    });
+      // Make trading decision
+      const decision = await this.makeDecision(context);
+      
+      logger.info('Market analysis complete', {
+        symbol,
+        decision: decision.action,
+        confidence: decision.confidence
+      });
 
-    // Liquidity optimization tool
-    this.agent.addToolHandler("optimize_liquidity", async (params: any) => {
-      return await this.liquidityOptimizer.optimize(
-        params.pair,
-        params.availableA,
-        params.availableB,
-        params.targetAPY
-      );
-    });
-
-    // MEV detection tool
-    this.agent.addToolHandler("detect_mev_risk", async (params: any) => {
-      return await this.mevDetector.detect(
-        params.transactionData,
-        params.mempool
-      );
-    });
-
-    // Trade execution tool
-    this.agent.addToolHandler("execute_trade", async (params: any) => {
-      return await this.hyperionClient.executeTrade(params);
-    });
+      return decision;
+    } catch (error) {
+      logger.error('Market analysis failed', { symbol, error });
+      throw error;
+    }
   }
 
-  /**
-   * Parse AI response into structured trading signal
-   */
-  private parseAIResponse(response: string, marketData: MarketData): TradingSignal {
-    // Enhanced parsing logic would go here
-    // For now, return a basic signal
+  private async getMarketData(symbol: string): Promise<MarketData> {
+    // In production, this would fetch from real market data API
+    const mockPrice = 100 + Math.random() * 10; // Mock price data
+    
     return {
-      action: "HOLD",
-      confidence: 50,
-      expectedPrice: marketData.price,
-      riskLevel: "MEDIUM",
-      mevRisk: false
+      symbol,
+      price: mockPrice,
+      volume: Math.random() * 1000000,
+      timestamp: Date.now(),
+      high24h: mockPrice * 1.05,
+      low24h: mockPrice * 0.95,
+      change24h: (Math.random() - 0.5) * 0.1
     };
   }
 
-  /**
-   * Generate fallback signal when AI analysis fails
-   */
-  private generateFallbackSignal(marketData: MarketData): TradingSignal {
+  private async calculateConfidence(marketData: MarketData, prediction: number): Promise<number> {
+    // Calculate confidence based on various factors
+    const volatility = Math.abs((marketData.high24h || marketData.price) - (marketData.low24h || marketData.price)) / marketData.price;
+    const priceDirection = Math.sign(prediction - marketData.price);
+    const trendConfidence = Math.abs(marketData.change24h || 0) > 0.02 ? 0.8 : 0.6;
+    
+    // Combine factors to get overall confidence
+    const baseConfidence = Math.max(0.1, 1 - volatility);
+    return Math.min(0.95, baseConfidence * trendConfidence);
+  }
+
+  private async getPortfolioStatus() {
+    // Mock portfolio data - in production would fetch from blockchain
     return {
-      action: "HOLD",
-      confidence: 30,
-      expectedPrice: marketData.price,
-      riskLevel: "HIGH",
-      mevRisk: false
+      balance: 1000,
+      positions: [
+        { symbol: 'ETH', amount: 0.5, value: 1600 },
+        { symbol: 'METIS', amount: 100, value: 3500 }
+      ]
     };
   }
 
-  /**
-   * Generate recommendation based on AI model outputs
-   */
-  private generateRecommendation(
-    pricePrediction: any,
-    liquidityAnalysis: any,
-    mevRisk: any
-  ): TradingSignal {
-    // Complex recommendation logic based on AI outputs
+  private async makeDecision(context: TradingContext): Promise<TradingDecision> {
+    const { marketData, prediction, confidence, portfolio } = context;
+    
+    // Check minimum confidence threshold
+    if (confidence < this.config.minConfidence) {
+      return {
+        action: 'hold',
+        confidence,
+        reason: `Confidence ${confidence.toFixed(2)} below threshold ${this.config.minConfidence}`
+      };
+    }
+
+    const priceChange = (prediction - marketData.price) / marketData.price;
+    const expectedProfit = Math.abs(priceChange);
+
+    // Risk management
+    const riskAdjustedAmount = this.calculatePositionSize(portfolio.balance, confidence);
+
+    if (priceChange > 0.02 && expectedProfit > 0.01) {
+      return {
+        action: 'buy',
+        confidence,
+        amount: riskAdjustedAmount,
+        reason: `Predicted price increase of ${(priceChange * 100).toFixed(2)}%`
+      };
+    } else if (priceChange < -0.02 && expectedProfit > 0.01) {
+      return {
+        action: 'sell',
+        confidence,
+        amount: riskAdjustedAmount,
+        reason: `Predicted price decrease of ${(priceChange * 100).toFixed(2)}%`
+      };
+    }
+
     return {
-      action: pricePrediction.trend > 0 ? "BUY" : "SELL",
-      confidence: Math.min(pricePrediction.confidence, liquidityAnalysis.confidence),
-      expectedPrice: pricePrediction.predictedPrice,
-      riskLevel: mevRisk.level,
-      mevRisk: mevRisk.detected
+      action: 'hold',
+      confidence,
+      reason: `Price change ${(priceChange * 100).toFixed(2)}% insufficient for action`
+    };
+  }
+
+  private calculatePositionSize(balance: number, confidence: number): number {
+    const maxRisk = balance * this.config.riskTolerance;
+    const confidenceAdjusted = maxRisk * confidence;
+    return Math.min(confidenceAdjusted, balance * this.config.maxPositionSize);
+  }
+
+  async executeTrade(decision: TradingDecision, symbol: string): Promise<boolean> {
+    if (decision.action === 'hold') {
+      logger.info('No action required', { symbol, decision });
+      return true;
+    }
+
+    try {
+      logger.info('Executing trade', { symbol, decision });
+
+      const success = await this.hyperionClient.executeTrade({
+        action: decision.action,
+        symbol,
+        amount: decision.amount || 0,
+        maxSlippage: 0.005 // 0.5% max slippage
+      });
+
+      if (success) {
+        logger.info('Trade executed successfully', { symbol, decision });
+      } else {
+        logger.error('Trade execution failed', { symbol, decision });
+      }
+
+      return success;
+    } catch (error) {
+      logger.error('Trade execution error', { symbol, decision, error });
+      return false;
+    }
+  }
+
+  async startTrading(symbols: string[], intervalMs: number = 30000): Promise<void> {
+    if (!this.isInitialized) {
+      throw new Error('Agent not initialized');
+    }
+
+    logger.info('Starting automated trading', { symbols, intervalMs });
+
+    const tradingLoop = async () => {
+      for (const symbol of symbols) {
+        try {
+          const decision = await this.analyzeMarket(symbol);
+          await this.executeTrade(decision, symbol);
+          
+          // Small delay between symbols
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (error) {
+          logger.error('Trading loop error', { symbol, error });
+        }
+      }
+    };
+
+    // Initial run
+    await tradingLoop();
+
+    // Set up interval
+    setInterval(tradingLoop, intervalMs);
+  }
+
+  async stop(): Promise<void> {
+    logger.info('Stopping TradingAgent', { name: this.config.name });
+    this.isInitialized = false;
+  }
+
+  getStatus() {
+    return {
+      name: this.config.name,
+      initialized: this.isInitialized,
+      config: this.config
     };
   }
 } 
